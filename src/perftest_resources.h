@@ -1215,4 +1215,6 @@ int data_validation_stop_and_report(struct pingpong_context *ctx,
 			   const char *role);
 void data_validation_destroy(struct pingpong_context *ctx);
 
+int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_param);
+
 #endif /* PERFTEST_RESOURCES_H */

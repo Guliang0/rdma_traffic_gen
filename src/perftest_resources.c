@@ -7344,3 +7344,227 @@ void data_validation_destroy(struct pingpong_context *ctx)
 	if (ctx->memory && ctx->memory->validation_destroy)
 		ctx->memory->validation_destroy(ctx->memory);
 }
+
+int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_param)
+{
+	uint64_t           	totscnt = 0;
+	uint64_t       	   	totccnt = 0;
+	int                	i = 0;
+	int			index;
+	int			ne = 0;
+	uint64_t	   	tot_iters;
+	int			err = 0;
+	struct ibv_wc 	   	*wc = NULL;
+	int 			num_of_qps = user_param->num_of_qps;
+	/* Rate Limiter*/
+	int 			rate_limit_pps = 0;
+	double 			gap_time = 0;	/* in usec */
+	cycles_t 		gap_cycles = 0;	/* in cycles */
+	cycles_t 		gap_deadline = 0;
+	double 		number_of_bursts = 0;
+	int 			burst_iter = 0;
+	int 			is_sending_burst = 0;
+	int 			cpu_mhz = 0;
+	int 			return_value = 0;
+	int			qp_index;
+	int			send_flows_index = 0;
+	uintptr_t		primary_send_addr = ctx->sge_list[0].addr;
+	int			address_offset = 0;
+	int			flows_burst_iter = 0;
+
+	struct dyn_poll_ctx *dyn_ctx = init_dyn_poll_ctx(user_param);
+	if (!dyn_ctx) {
+		fprintf(stderr, "Failed to allocate dynamic polling context\n");
+		return FAILURE;
+	}
+
+    if (user_param->test_type != ITERATIONS) {
+		fprintf(stderr, "my_run_iter_bw only supports ITERATIONS\n");
+		return FAILURE;
+	}
+
+	if (user_param->post_list != 1) {
+		fprintf(stderr, "my_run_iter_bw only supports post_list == 1\n");
+		return FAILURE;
+	}
+
+	if (user_param->duplex) {
+		fprintf(stderr, "my_run_iter_bw does not support duplex yet\n");
+		return FAILURE;
+	}
+
+	if (user_param->rate_limit_type == SW_RATE_LIMIT) {
+		fprintf(stderr, "my_run_iter_bw does not support SW rate limit yet\n");
+		return FAILURE;
+	}
+
+	if (user_param->flows != DEF_FLOWS) {
+		fprintf(stderr, "my_run_iter_bw does not support multi-flow yet\n");
+		return FAILURE;
+	}
+
+	#ifdef HAVE_IBV_WR_API
+	if (user_param->connection_type != RawEth)
+		ctx_post_send_work_request_func_pointer(ctx, user_param);
+	#endif
+
+	ALLOCATE(wc ,struct ibv_wc ,dyn_ctx->config.max);
+
+    /* Will be 0, in case of Duration (look at force_dependencies or in the exp above). */
+	tot_iters = (uint64_t)user_param->iters*num_of_qps;
+
+
+	if (user_param->test_type == ITERATIONS && user_param->noPeak == ON)
+		user_param->tposted[0] = get_cycles();
+
+	gap_deadline = get_cycles();
+
+    /*YJT: MAINLY MODIFY*/
+	/* main loop for posting */
+	while (totscnt < tot_iters  || totccnt < tot_iters) {
+
+		/* main loop to run over all the qps and post each time n messages */
+		for (index =0 ; index < num_of_qps ; index++) {
+
+			while ((ctx->scnt[index] < user_param->iters) &&
+					(ctx->scnt[index] + user_param->post_list) <= (user_param->tx_depth + ctx->ccnt[index])) {
+
+
+                //CQ MOD TO CONTROL CQE GENERATE FREQUENCY
+				if (user_param->post_list == 1 && (ctx->scnt[index] % user_param->cq_mod == 0 && user_param->cq_mod > 1)
+					&& !(ctx->scnt[index] == (user_param->iters - 1) && user_param->test_type == ITERATIONS)) {
+					ctx->wr[index].send_flags &= ~IBV_SEND_SIGNALED;
+				}
+
+				if (user_param->noPeak == OFF)
+					user_param->tposted[totscnt] = get_cycles();
+                
+
+                /*YJT: TODO MODIFY CTX & USER_PARAM TO SELF DEFINE WQE*/
+                /*LIKE*/
+				uint32_t wr_size = 4096; //my_get_next_wr_size(...);  
+				uint64_t local_offset = 0;
+				uint64_t remote_offset = 0;
+                
+				if (wr_size > user_param->size) {
+					fprintf(stderr, "wr_size %u exceeds max MR size %lu\n",
+							wr_size, (unsigned long)user_param->size);
+					return_value = FAILURE;
+					goto cleaning;
+				}
+
+				ctx->wr[index].sg_list->addr = ctx->my_addr[index] + local_offset;
+				ctx->wr[index].sg_list->length = wr_size;
+
+				ctx->wr[index].wr.rdma.remote_addr = ctx->rem_addr[index] + remote_offset;
+
+				// user_param->size = size;
+                /*YJT: TODO END*/
+
+		        /*YJT: TODO, ADD PRINT FOR SGE LIST AND DATA VALIDATION*/
+                // LIKE: 
+                if ((ctx->scnt[index] <= 10) && ctx->wr[index].sg_list != &ctx->sge_list[index]) {
+                   fprintf(stderr, "unexpected sg_list mapping\n");
+                }
+
+				uint64_t magic = 0xdeadbeef00000000ULL | (ctx->scnt[index] & 0xffffffff);
+
+				memset((void *)(uintptr_t)ctx->wr[index].sg_list->addr, 0, wr_size);
+				*(uint64_t *)(uintptr_t)ctx->wr[index].sg_list->addr = magic;
+
+				fprintf(stderr,
+						"[send] qp=%d wr=%lu local_addr=%p local_off=%lu remote_addr=0x%lx remote_off=%lu size=%u data=%016lx\n",
+						index,
+						(unsigned long)ctx->scnt[index],
+						(void *)(uintptr_t)ctx->wr[index].sg_list->addr,
+						(unsigned long)local_offset,
+						(unsigned long)ctx->wr[index].wr.rdma.remote_addr,
+						(unsigned long)remote_offset,
+						wr_size,
+						*(uint64_t *)(uintptr_t)ctx->wr[index].sg_list->addr);
+
+			    err = post_send_method(ctx, index, user_param);
+			    if (err) {
+			    	fprintf(stderr,"Couldn't post send: qp %d scnt=%lu || err=%d tx_depth=%d\n",index,ctx->scnt[index],err,user_param->tx_depth	);
+			    	return_value = FAILURE;
+			    	goto cleaning;
+			    }
+                
+
+                /* YJT: INCRESE LOCAL & REMOTE ADDR, CONTROLED MANUALLY */
+			    // if (user_param->post_list == 1 && user_param->size <= (ctx->cycle_buffer / 2)) {
+			    // 		increase_loc_addr(ctx->wr[index].sg_list,user_param->size, ctx->scnt[index],
+			    // 				ctx->my_addr[index] + address_offset , 0, ctx->cache_line_size,
+			    // 				ctx->cycle_buffer);
+
+			    // 	if (user_param->verb != SEND) {
+			    // 		increase_rem_addr(&ctx->wr[index], user_param->size,
+			    // 				ctx->scnt[index], ctx->rem_addr[index], user_param->verb,
+			    // 				ctx->cache_line_size, ctx->cycle_buffer);
+			    // 	}
+			    // }
+
+                //YJT: RENEW SEND COUNT
+			    ctx->scnt[index] += user_param->post_list;
+			    totscnt += user_param->post_list;
+
+				/* ask for completion on this wr */
+                /*YJT: ADD BACK CQE GEN FOR SOME POST SEND */
+				if (user_param->post_list == 1 &&
+						(ctx->scnt[index]%user_param->cq_mod == user_param->cq_mod - 1 ||
+							(user_param->test_type == ITERATIONS && ctx->scnt[index] == user_param->iters - 1))) {
+						ctx->wr[index].send_flags |= IBV_SEND_SIGNALED;
+				}
+			}//YJT: MAY JUMP OUT OF POST LOOP WHEN WINDOW FULL, INTO CQ POLLING LOOP, THEN BACK TO POST LOOP WHEN WINDOW AVAILABLE
+		}
+
+        //YJT: DELETED NO USE CODE BLOCKS
+		if (totccnt < tot_iters) {
+				/* Dynamic CQE poll size adaptation */
+				ne = poll_completions(
+					ctx->send_cq,
+					wc,
+					dyn_ctx,
+					totccnt,
+					&user_param->dynamic_cqe_poll);
+
+				if (ne > 0) {
+					for (i = 0; i < ne; i++) {
+						qp_index = (int)get_wr_id_qp_index(wc[i].wr_id);
+
+						if (wc[i].status != IBV_WC_SUCCESS) {
+							NOTIFY_COMP_ERROR_SEND(wc[i],totscnt,totccnt);
+							return_value = FAILURE;
+							goto cleaning;
+						}
+						int fill = user_param->cq_mod;
+						if (user_param->fill_count && ctx->ccnt[qp_index] + user_param->cq_mod > user_param->iters) {
+							fill = user_param->iters - ctx->ccnt[qp_index];
+						}
+						ctx->ccnt[qp_index] += fill;
+						totccnt += fill;
+
+						if (user_param->noPeak == OFF) {
+							if (totccnt > tot_iters)
+								user_param->tcompleted[user_param->iters*num_of_qps - 1] = get_cycles();
+							else
+								user_param->tcompleted[totccnt-1] = get_cycles();
+						}
+					}
+
+					} else if (ne < 0) {
+						fprintf(stderr, "poll CQ failed %d\n",ne);
+						return_value = FAILURE;
+						goto cleaning;
+					}
+
+		}
+	}
+	if (user_param->noPeak == ON && user_param->test_type == ITERATIONS)
+		user_param->tcompleted[0] = get_cycles();
+
+cleaning:
+	free(dyn_ctx);
+	free(wc);
+	return return_value;
+}
