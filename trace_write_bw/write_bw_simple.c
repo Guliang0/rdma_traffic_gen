@@ -4,6 +4,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <stdint.h>
+#include <time.h>
 
 #define NRANKS_EXPECTED 3
 #define PORT_BASE 18515
@@ -25,19 +27,37 @@ static void port_for_conn(int src, int dst, char *buf, size_t len)
     snprintf(buf, len, "%d", PORT_BASE + src * NRANKS_EXPECTED + dst);
 }
 
-static pid_t spawn_write_bw(int rank, const char *bin, const char *port,
-                            const char *server_ip,
-                            int argc, char **argv)
+static uint64_t wall_time_ns(void)
 {
-    /*
-     * argv[0] = launcher
-     * argv[1] = $HOME/rdma_traffic_gen/perftest/ib_write_bw
-     * argv[2..] = common ib_write_bw args
-     *
-     * server_ip == NULL: run server mode
-     * server_ip != NULL: run client mode and connect to server_ip
-     */
-    printf("11111");
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void setenv_int(const char *name, int value)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", value);
+    setenv(name, buf, 1);
+}
+
+static void setenv_u64(const char *name, uint64_t value)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)value);
+    setenv(name, buf, 1);
+}
+
+static pid_t spawn_write_bw(int rank,
+                            const char *bin,
+                            const char *port,
+                            const char *server_ip,
+                            int src_rank,
+                            int dst_rank,
+                            uint64_t global_start_ns,
+                            int argc,
+                            char **argv)
+{
     int common_argc = argc - 2;
     int extra = server_ip ? 5 : 4;
     char **cmd = calloc(common_argc + extra, sizeof(char *));
@@ -68,6 +88,16 @@ static pid_t spawn_write_bw(int rank, const char *bin, const char *port,
     }
 
     if (pid == 0) {
+        setenv("TRACE_ROLE", server_ip ? "client" : "server", 1);
+        setenv_int("TRACE_MY_RANK", rank);
+        setenv_int("TRACE_SRC_RANK", src_rank);
+        setenv_int("TRACE_DST_RANK", dst_rank);
+        setenv_int("TRACE_PEER_RANK", server_ip ? dst_rank : src_rank);
+        setenv_u64("TRACE_GLOBAL_START_NS", global_start_ns);
+
+        if (server_ip)
+            setenv("TRACE_SERVER_IP", server_ip, 1);
+
         fprintf(stderr, "[rank %d] exec:", rank);
         for (int i = 0; cmd[i]; i++)
             fprintf(stderr, " %s", cmd[i]);
@@ -93,6 +123,7 @@ int main(int argc, char **argv)
         servers[i] = -1;
         clients[i] = -1;
     }
+    uint64_t global_start_ns = 0;
 
     fprintf(stderr, "before MPI_Init\n");
     fflush(stderr);
@@ -134,12 +165,15 @@ int main(int argc, char **argv)
                 rank, src, rank_cx_ip[rank], port);
         fflush(stderr);
 
-        servers[src] = spawn_write_bw(rank, bin, port, NULL, argc, argv);
+        servers[src] = spawn_write_bw(rank, bin, port, NULL, src, rank, global_start_ns, argc, argv);    
     }
-
     sleep(2);
     MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) {
+        global_start_ns = wall_time_ns() + 10ULL * 1000 * 1000 * 1000;
+    }
 
+    MPI_Bcast(&global_start_ns, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
     /*
      * Step 2: each rank starts one client for each outgoing connection.
      * Client on rank src connects to rank dst at port_for_conn(src, dst).
@@ -159,6 +193,7 @@ int main(int argc, char **argv)
 
         clients[dst] = spawn_write_bw(rank, bin, port,
                                       rank_cx_ip[dst],
+                                      rank, dst, global_start_ns,
                                       argc, argv);
         if (clients[dst] < 0) {
             fprintf(stderr, "[rank %d] failed to start client for dst %d\n",

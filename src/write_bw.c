@@ -57,6 +57,24 @@ struct trace_bw_runtime {
 	int trace_dst_id;
 };
 
+
+static uint64_t getenv_u64_default(const char *name, uint64_t def)
+{
+    const char *s = getenv(name);
+    if (!s || !*s)
+        return def;
+    return strtoull(s, NULL, 10);
+}
+
+static int getenv_int_default(const char *name, int def)
+{
+    const char *s = getenv(name);
+    if (!s || !*s)
+        return def;
+    return atoi(s);
+}
+
+
 static int trace_node_id_from_ip(const char *ip, int *node_id)
 {
 	size_t i;
@@ -440,6 +458,22 @@ int trace_bw_prepare(int argc, char **argv, struct trace_bw_runtime *rt){
 	memset(&rt->user_param,0,sizeof(struct perftest_parameters));
 	memset(&rt->user_comm,0,sizeof(struct perftest_comm));
 	memset(&rt->ctx,0,sizeof(struct pingpong_context));
+
+
+	int my_rank = getenv_int_default("TRACE_MY_RANK", -1);
+	int src_rank = getenv_int_default("TRACE_SRC_RANK", -1);
+	int dst_rank = getenv_int_default("TRACE_DST_RANK", -1);
+	int peer_rank = getenv_int_default("TRACE_PEER_RANK", -1);
+	uint64_t global_start_ns = getenv_u64_default("TRACE_GLOBAL_START_NS", 0);
+
+	fprintf(stderr,
+			"[trace params] role=%s my_rank=%d src=%d dst=%d peer=%d global_start_ns=%lu\n",
+			getenv("TRACE_ROLE"),
+			my_rank,
+			src_rank,
+			dst_rank,
+			peer_rank,
+			(unsigned long)global_start_ns);
 
 	rt->user_param.verb    = WRITE;
 	rt->user_param.tst     = BW;
