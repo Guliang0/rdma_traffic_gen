@@ -7445,6 +7445,11 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 		return FAILURE;
 	}
 
+	if (user_param->num_of_qps != 1) {
+		fprintf(stderr, "my_run_iter_bw only supports num_of_qps == 1\n");
+		return FAILURE;
+	}
+
 	#ifdef HAVE_IBV_WR_API
 	if (user_param->connection_type != RawEth)
 		ctx_post_send_work_request_func_pointer(ctx, user_param);
@@ -7479,31 +7484,25 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 					ctx->wr[index].send_flags &= ~IBV_SEND_SIGNALED;
 				}
 
-				//YJT: TODO, USE INPUT VALUE
-				size_list[0] = 100;
-				size_list[1] = 200;
-				size_list[2] = 300;
-				size_list[3] = 300;
-				size_list[4] = 300;
-				size_list[5] = 300;
-				size_list[6] = 300;
-				size_list[7] = 300;
-				size_list[8] = 300;
-
-				time_ns_list[0] = 0000000000;
-				time_ns_list[1] = 1000000000;
-				time_ns_list[2] = 2000000000;
-				time_ns_list[3] = 2000000000;
-				time_ns_list[4] = 3000000000;
-				time_ns_list[5] = 4000000000;
-				time_ns_list[6] = 4000000000;
-				time_ns_list[7] = 5000000000;
-				time_ns_list[8] = 6000000000;
+				if (totscnt >= (uint64_t)user_param->iters) {
+					fprintf(stderr, "trace index %lu exceeds iters %lu\n",
+							(unsigned long)totscnt,
+							(unsigned long)user_param->iters);
+					return_value = FAILURE;
+					goto cleaning;
+				}
 
 				uint32_t wr_size = size_list[totscnt]; //my_get_next_wr_size(...);  
 				uint64_t local_offset = 0;
 				uint64_t remote_offset = 0;
                 
+				if (wr_size == 0) {
+					fprintf(stderr, "trace wr_size is zero at index %lu\n",
+							(unsigned long)totscnt);
+					return_value = FAILURE;
+					goto cleaning;
+				}
+
 				if (wr_size > user_param->size) {
 					fprintf(stderr, "wr_size %u exceeds max MR size %lu\n",
 							wr_size, (unsigned long)user_param->size);
