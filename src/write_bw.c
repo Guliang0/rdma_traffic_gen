@@ -19,6 +19,9 @@ struct trace_bw_runtime {
     struct bw_report_data my_bw_rep;
     struct bw_report_data rem_bw_rep;
 	int rdma_cm_flow_destroyed;
+	
+	uint64_t time_ns_list[10000];
+	uint32_t size_list[10000];
 };
 
 int trace_bw_prepare(int argc, char **argv, struct trace_bw_runtime *rt){
@@ -302,7 +305,7 @@ int trace_bw_run_once(struct trace_bw_runtime *rt){
 
 		if (rt->user_param.machine == CLIENT || rt->user_param.verb != WRITE_IMM) {
 
-			if ((rt->user_param.data_validation ? run_iter_bw_dv : my_run_iter_bw)(&rt->ctx,&rt->user_param)) {
+			if ( my_run_iter_bw(&rt->ctx,&rt->user_param, rt->time_ns_list, rt->size_list)) {
 				fprintf(stderr," Failed to complete run_iter_bw function successfully\n");
 				return FAILURE;
 			}

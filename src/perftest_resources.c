@@ -20,6 +20,7 @@
 #if defined(__FreeBSD__)
 #include <sys/stat.h>
 #endif
+#include <emmintrin.h>
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
@@ -7345,7 +7346,44 @@ void data_validation_destroy(struct pingpong_context *ctx)
 		ctx->memory->validation_destroy(ctx->memory);
 }
 
-int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_param)
+static inline uint64_t my_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+
+static inline void my_sleep_until_ns(uint64_t target_ns)
+{
+    const uint64_t spin_threshold_ns = 5000;   // 最后 5 us busy wait
+
+    while (1) {
+        uint64_t now = my_now_ns();
+
+        if (now >= target_ns)
+            break;
+
+        uint64_t remain = target_ns - now;
+
+        if (remain > spin_threshold_ns) {
+            struct timespec req;
+            uint64_t sleep_ns = remain - spin_threshold_ns;
+
+            req.tv_sec = sleep_ns / 1000000000ULL;
+            req.tv_nsec = sleep_ns % 1000000000ULL;
+
+            while (nanosleep(&req, &req) == -1 && errno == EINTR)
+                ;
+        } else {
+            while (my_now_ns() < target_ns)
+                _mm_pause();
+            break;
+        }
+    }
+}
+
+int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_param, uint64_t *time_ns_list, uint32_t *size_list)
 {
 	uint64_t           	totscnt = 0;
 	uint64_t       	   	totccnt = 0;
@@ -7371,6 +7409,10 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 	uintptr_t		primary_send_addr = ctx->sge_list[0].addr;
 	int			address_offset = 0;
 	int			flows_burst_iter = 0;
+	uint64_t 			base_time_ns = 0;
+
+
+
 
 	struct dyn_poll_ctx *dyn_ctx = init_dyn_poll_ctx(user_param);
 	if (!dyn_ctx) {
@@ -7425,10 +7467,11 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 
 		/* main loop to run over all the qps and post each time n messages */
 		for (index =0 ; index < num_of_qps ; index++) {
-
+			if(ctx->scnt[index] == 0){
+					base_time_ns = my_now_ns();
+			} 
 			while ((ctx->scnt[index] < user_param->iters) &&
 					(ctx->scnt[index] + user_param->post_list) <= (user_param->tx_depth + ctx->ccnt[index])) {
-
 
                 //CQ MOD TO CONTROL CQE GENERATE FREQUENCY
 				if (user_param->post_list == 1 && (ctx->scnt[index] % user_param->cq_mod == 0 && user_param->cq_mod > 1)
@@ -7436,13 +7479,28 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 					ctx->wr[index].send_flags &= ~IBV_SEND_SIGNALED;
 				}
 
-				if (user_param->noPeak == OFF)
-					user_param->tposted[totscnt] = get_cycles();
-                
+				//YJT: TODO, USE INPUT VALUE
+				size_list[0] = 100;
+				size_list[1] = 200;
+				size_list[2] = 300;
+				size_list[3] = 300;
+				size_list[4] = 300;
+				size_list[5] = 300;
+				size_list[6] = 300;
+				size_list[7] = 300;
+				size_list[8] = 300;
 
-                /*YJT: TODO MODIFY CTX & USER_PARAM TO SELF DEFINE WQE*/
-                /*LIKE*/
-				uint32_t wr_size = 4096; //my_get_next_wr_size(...);  
+				time_ns_list[0] = 0000000000;
+				time_ns_list[1] = 1000000000;
+				time_ns_list[2] = 2000000000;
+				time_ns_list[3] = 2000000000;
+				time_ns_list[4] = 3000000000;
+				time_ns_list[5] = 4000000000;
+				time_ns_list[6] = 4000000000;
+				time_ns_list[7] = 5000000000;
+				time_ns_list[8] = 6000000000;
+
+				uint32_t wr_size = size_list[totscnt]; //my_get_next_wr_size(...);  
 				uint64_t local_offset = 0;
 				uint64_t remote_offset = 0;
                 
@@ -7452,18 +7510,13 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 					return_value = FAILURE;
 					goto cleaning;
 				}
-
+				
 				ctx->wr[index].sg_list->addr = ctx->my_addr[index] + local_offset;
 				ctx->wr[index].sg_list->length = wr_size;
 
 				ctx->wr[index].wr.rdma.remote_addr = ctx->rem_addr[index] + remote_offset;
 
-				// user_param->size = size;
-                /*YJT: TODO END*/
-
-		        /*YJT: TODO, ADD PRINT FOR SGE LIST AND DATA VALIDATION*/
-                // LIKE: 
-                if ((ctx->scnt[index] <= 10) && ctx->wr[index].sg_list != &ctx->sge_list[index]) {
+				if ((ctx->scnt[index] <= 10) && ctx->wr[index].sg_list != &ctx->sge_list[index]) {
                    fprintf(stderr, "unexpected sg_list mapping\n");
                 }
 
@@ -7471,9 +7524,9 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 
 				memset((void *)(uintptr_t)ctx->wr[index].sg_list->addr, 0, wr_size);
 				*(uint64_t *)(uintptr_t)ctx->wr[index].sg_list->addr = magic;
-
+				uint64_t target_ns = base_time_ns + time_ns_list[totscnt];
 				fprintf(stderr,
-						"[send] qp=%d wr=%lu local_addr=%p local_off=%lu remote_addr=0x%lx remote_off=%lu size=%u data=%016lx\n",
+						"[send] qp=%d wr=%lu local_addr=%p local_off=%lu remote_addr=0x%lx remote_off=%lu size=%u data=%016lx time=%lu curtime=%lu ns\n",
 						index,
 						(unsigned long)ctx->scnt[index],
 						(void *)(uintptr_t)ctx->wr[index].sg_list->addr,
@@ -7481,28 +7534,23 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 						(unsigned long)ctx->wr[index].wr.rdma.remote_addr,
 						(unsigned long)remote_offset,
 						wr_size,
-						*(uint64_t *)(uintptr_t)ctx->wr[index].sg_list->addr);
+						*(uint64_t *)(uintptr_t)ctx->wr[index].sg_list->addr,
+						(unsigned long)target_ns,
+						(unsigned long)my_now_ns()
+					);
 
-			    err = post_send_method(ctx, index, user_param);
+				
+				my_sleep_until_ns(target_ns);
+				
+				if (user_param->noPeak == OFF)
+					user_param->tposted[totscnt] = get_cycles();
+
+				err = post_send_method(ctx, index, user_param);
 			    if (err) {
 			    	fprintf(stderr,"Couldn't post send: qp %d scnt=%lu || err=%d tx_depth=%d\n",index,ctx->scnt[index],err,user_param->tx_depth	);
 			    	return_value = FAILURE;
 			    	goto cleaning;
 			    }
-                
-
-                /* YJT: INCRESE LOCAL & REMOTE ADDR, CONTROLED MANUALLY */
-			    // if (user_param->post_list == 1 && user_param->size <= (ctx->cycle_buffer / 2)) {
-			    // 		increase_loc_addr(ctx->wr[index].sg_list,user_param->size, ctx->scnt[index],
-			    // 				ctx->my_addr[index] + address_offset , 0, ctx->cache_line_size,
-			    // 				ctx->cycle_buffer);
-
-			    // 	if (user_param->verb != SEND) {
-			    // 		increase_rem_addr(&ctx->wr[index], user_param->size,
-			    // 				ctx->scnt[index], ctx->rem_addr[index], user_param->verb,
-			    // 				ctx->cache_line_size, ctx->cycle_buffer);
-			    // 	}
-			    // }
 
                 //YJT: RENEW SEND COUNT
 			    ctx->scnt[index] += user_param->post_list;
