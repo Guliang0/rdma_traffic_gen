@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -262,14 +263,16 @@ int trace_bw_prepare(int argc, char **argv, struct trace_bw_runtime *rt){
 		printf((rt->user_param.cpu_util_data.enable ? RESULT_EXT_CPU_UTIL : RESULT_EXT));
 	}
 
-	fprintf(stderr,
-        "[debug recv base] ctx.buf=%p my_dest.vaddr=0x%lx ctx.my_addr[0]=0x%lx rem_addr[0]=0x%lx size=%lu cycle_buffer=%lu\n",
-        rt->ctx.buf,
-        (unsigned long)rt->my_dest[0].vaddr,
-        (unsigned long)rt->ctx.my_addr[0],
-        (unsigned long)rt->ctx.rem_addr[0],
-        (unsigned long)rt->user_param.size,
-        (unsigned long)rt->ctx.cycle_buffer);
+		uintptr_t buf_base = (uintptr_t)rt->ctx.buf;
+		uintptr_t rdma_base = (uintptr_t)rt->my_dest[0].vaddr;
+
+		fprintf(stderr,
+				"[debug recv] ctx.buf=%p my_dest[0].vaddr=0x%lx diff=%ld size=%lu cycle_buffer=%lu\n",
+				rt->ctx.buf,
+				(unsigned long)rdma_base,
+				(long)(rdma_base - buf_base),
+				(unsigned long)rt->user_param.size,
+				(unsigned long)rt->ctx.cycle_buffer);
 
 	//END AT LINE 272
 	return 0;
@@ -352,6 +355,22 @@ int trace_bw_cleanup(struct trace_bw_runtime *rt){
 		}
 		
 		// YJT: TODO: ADD CHECK FOR DATA , ALL PRINT OUT
+		uint64_t print_len = rt->user_param.size < 256 ? rt->user_param.size : 256;
+
+		uintptr_t buf_base = (uintptr_t)rt->ctx.buf;
+		uintptr_t rdma_base = (uintptr_t)rt->my_dest[0].vaddr;
+
+		char *base = (char *)rt->ctx.buf + (rdma_base - buf_base);
+		
+		for (uint64_t off = 0; off + 8 <= print_len; off += 8) {
+			uint64_t val = *(uint64_t *)(base + off);
+
+			printf("[recv] base=%p addr=%p offset=%lu value=%016lx\n",
+				base,
+				base + off,
+				(unsigned long)off,
+				val);
+		}
 		// uintptr_t buf = (uintptr_t)rt->ctx.buf;
 		// uintptr_t vaddr = (uintptr_t)rt->my_dest[0].vaddr;
 		// uintptr_t off = vaddr - buf;
