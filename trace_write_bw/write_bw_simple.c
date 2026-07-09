@@ -102,7 +102,15 @@ static pid_t spawn_write_bw(int rank,
         for (int i = 0; cmd[i]; i++)
             fprintf(stderr, " %s", cmd[i]);
         fprintf(stderr, "\n");
-
+        if(global_start_ns > 0) {
+            struct timespec target;
+            target.tv_sec = global_start_ns / 1000000000ULL;
+            target.tv_nsec = global_start_ns % 1000000000ULL;
+            fprintf(stderr, "[rank %d] waiting until %lu.%09lu\n",
+                    rank, (unsigned long)target.tv_sec, (unsigned long)target.tv_nsec);
+            fflush(stderr);
+            clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &target, NULL);
+        }
         execvp(bin, cmd);
         perror("execvp");
         _exit(127);
