@@ -6,9 +6,6 @@
 #include <errno.h>
 #include <ctype.h>
 #include <limits.h>
-#include <ifaddrs.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 
 #include "perftest_parameters.h"
 #include "perftest_resources.h"
@@ -16,24 +13,7 @@
 
 #define TRACE_FILE_PATH "trace_write_bw/data/Websearch60.txt"
 #define TRACE_MAX_FLOWS 10000
-#define TRACE_SUPPORTED_SRC 1
-#define TRACE_SUPPORTED_DST 0
 #define TRACE_MAX_WR_SIZE ((uint64_t)UINT_MAX / 2)
-
-struct trace_node_map {
-	const char *ip;
-	int node_id;
-};
-
-static const struct trace_node_map trace_nodes[] = {
-	{ "192.168.2.13", 0 }, /* dcn11 / lingbo6 */
-	{ "192.168.2.9",  1 }, /* dcn12 / lingbo7 */
-};
-
-struct trace_bw_metadata {
-	uint64_t trace_count;
-	uint64_t max_size;
-};
 
 struct trace_bw_runtime {
     struct pingpong_context ctx;
@@ -58,129 +38,12 @@ struct trace_bw_runtime {
 };
 
 
-static uint64_t getenv_u64_default(const char *name, uint64_t def)
-{
-    const char *s = getenv(name);
-    if (!s || !*s)
-        return def;
-    return strtoull(s, NULL, 10);
-}
-
 static int getenv_int_default(const char *name, int def)
 {
     const char *s = getenv(name);
     if (!s || !*s)
         return def;
     return atoi(s);
-}
-
-
-static int trace_node_id_from_ip(const char *ip, int *node_id)
-{
-	size_t i;
-
-	for (i = 0; i < GET_ARRAY_SIZE(trace_nodes); i++) {
-		if (!strcmp(ip, trace_nodes[i].ip)) {
-			*node_id = trace_nodes[i].node_id;
-			return SUCCESS;
-		}
-	}
-
-	return FAILURE;
-}
-
-static int trace_get_local_node_id(int *node_id, char *ip_buf, size_t ip_buf_len)
-{
-	struct ifaddrs *ifaddr = NULL, *ifa;
-	int found = 0;
-
-	if (getifaddrs(&ifaddr)) {
-		fprintf(stderr, "Failed to get local interface addresses: %s\n", strerror(errno));
-		return FAILURE;
-	}
-
-	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-		char addr[INET_ADDRSTRLEN];
-		int candidate;
-
-		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
-			continue;
-
-		if (!inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr,
-			       addr, sizeof(addr)))
-			continue;
-
-		if (trace_node_id_from_ip(addr, &candidate))
-			continue;
-
-		if (found && *node_id != candidate) {
-			fprintf(stderr, "Multiple known trace node IPs found locally\n");
-			freeifaddrs(ifaddr);
-			return FAILURE;
-		}
-
-		found = 1;
-		*node_id = candidate;
-		snprintf(ip_buf, ip_buf_len, "%s", addr);
-	}
-
-	freeifaddrs(ifaddr);
-
-	if (!found) {
-		fprintf(stderr, "Local host IP is not in trace node map\n");
-		return FAILURE;
-	}
-
-	return SUCCESS;
-}
-
-static int trace_resolve_node_id(const char *name, int *node_id, char *ip_buf, size_t ip_buf_len)
-{
-	struct addrinfo hints, *res = NULL, *rp;
-	struct in_addr parsed_addr;
-	int rc;
-
-	if (!name) {
-		fprintf(stderr, "Trace client requires a server IP address\n");
-		return FAILURE;
-	}
-
-	if (inet_pton(AF_INET, name, &parsed_addr) == 1) {
-		if (trace_node_id_from_ip(name, node_id)) {
-			fprintf(stderr, "Server IP %s is not in trace node map\n", name);
-			return FAILURE;
-		}
-		snprintf(ip_buf, ip_buf_len, "%s", name);
-		return SUCCESS;
-	}
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	rc = getaddrinfo(name, NULL, &hints, &res);
-	if (rc) {
-		fprintf(stderr, "Failed to resolve server address %s: %s\n",
-			name, gai_strerror(rc));
-		return FAILURE;
-	}
-
-	for (rp = res; rp != NULL; rp = rp->ai_next) {
-		char addr[INET_ADDRSTRLEN];
-
-		if (!inet_ntop(AF_INET, &((struct sockaddr_in *)rp->ai_addr)->sin_addr,
-			       addr, sizeof(addr)))
-			continue;
-
-		if (!trace_node_id_from_ip(addr, node_id)) {
-			snprintf(ip_buf, ip_buf_len, "%s", addr);
-			freeaddrinfo(res);
-			return SUCCESS;
-		}
-	}
-
-	fprintf(stderr, "Server address %s did not resolve to a known trace node IP\n", name);
-	freeaddrinfo(res);
-	return FAILURE;
 }
 
 static int trace_timestamp_to_ns(const char *value, uint64_t *ns)
@@ -197,25 +60,12 @@ static int trace_timestamp_to_ns(const char *value, uint64_t *ns)
 	return SUCCESS;
 }
 
-static int trace_line_has_extra_text(const char *line, int offset)
-{
-	const unsigned char *p = (const unsigned char *)line + offset;
-
-	while (*p) {
-		if (!isspace(*p))
-			return 1;
-		p++;
-	}
-
-	return 0;
-}
-
 static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int dst_id)
 {
 	FILE *fp;
 	char line[512];
 	uint64_t count = 0, max_size = 0;
-	uint64_t first_ts_ns = 0, prev_match_ts_ns = 0, last_ts_ns = 0;
+	uint64_t first_ts_ns = 0, last_ts_ns = 0;
 	unsigned long line_no = 0;
 
 	fp = fopen(TRACE_FILE_PATH, "r");
@@ -226,20 +76,14 @@ static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int d
 	}
 
 	while (fgets(line, sizeof(line), fp)) {
-		int src, dst, nranks, consumed = 0;
+		int src, dst, nranks;
 		unsigned long long size;
 		char timestamp[128];
 		uint64_t timestamp_ns;
 
 		line_no++;
-		if (sscanf(line, " %d %d %d %llu %127s %n",
-			   &src, &dst, &nranks, &size, timestamp, &consumed) != 5 ||
-		    trace_line_has_extra_text(line, consumed)) {
-			fprintf(stderr, "%s:%lu: malformed trace record\n",
-				TRACE_FILE_PATH, line_no);
-			fclose(fp);
-			return FAILURE;
-		}
+		if (sscanf(line, "%d %d %d %llu %127s", &src, &dst, &nranks, &size, timestamp) != 5)
+			continue;
 
 		if (trace_timestamp_to_ns(timestamp, &timestamp_ns)) {
 			fprintf(stderr, "%s:%lu: malformed timestamp %s\n",
@@ -266,13 +110,6 @@ static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int d
 			return FAILURE;
 		}
 
-		if (count > 0 && timestamp_ns < prev_match_ts_ns) {
-			fprintf(stderr, "%s:%lu: timestamp moves backward for src=%d dst=%d\n",
-				TRACE_FILE_PATH, line_no, src_id, dst_id);
-			fclose(fp);
-			return FAILURE;
-		}
-
 		if (count == TRACE_MAX_FLOWS) {
 			fprintf(stderr, "%s:%lu: matched flow count exceeds capacity %d\n",
 				TRACE_FILE_PATH, line_no, TRACE_MAX_FLOWS);
@@ -286,7 +123,6 @@ static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int d
 		rt->time_ns_list[count] = timestamp_ns - first_ts_ns;
 		rt->size_list[count] = (uint32_t)size;
 		count++;
-		prev_match_ts_ns = timestamp_ns;
 		last_ts_ns = timestamp_ns;
 		if (size > max_size)
 			max_size = size;
@@ -355,92 +191,37 @@ static int trace_check_scope(struct perftest_parameters *user_param)
 
 static int trace_configure_runtime(struct trace_bw_runtime *rt)
 {
-	char local_ip[INET_ADDRSTRLEN];
-	int local_node;
+    int my_rank = getenv_int_default("TRACE_MY_RANK", -1);
+    int src_rank = getenv_int_default("TRACE_SRC_RANK", -1);
+    int dst_rank = getenv_int_default("TRACE_DST_RANK", -1);
+    int peer_rank = getenv_int_default("TRACE_PEER_RANK", -1);
 
-	if (trace_check_scope(&rt->user_param))
-		return FAILURE;
+    if (trace_check_scope(&rt->user_param))
+        return FAILURE;
 
-	if (trace_get_local_node_id(&local_node, local_ip, sizeof(local_ip)))
-		return FAILURE;
+    rt->trace_src_id = src_rank;
+    rt->trace_dst_id = dst_rank;
 
-	if (rt->user_param.machine == SERVER) {
-		if (local_node != TRACE_SUPPORTED_DST) {
-			fprintf(stderr, "Trace server must run on node %d, local %s is node %d\n",
-				TRACE_SUPPORTED_DST, local_ip, local_node);
-			return FAILURE;
-		}
-		rt->trace_src_id = TRACE_SUPPORTED_SRC;
-		rt->trace_dst_id = TRACE_SUPPORTED_DST;
-		return SUCCESS;
-	}
+    fprintf(stderr,
+            "[trace] role=%s my_rank=%d peer_rank=%d channel=%d->%d\n",
+            rt->user_param.machine == CLIENT ? "client" : "server",
+            my_rank,
+            peer_rank,
+            rt->trace_src_id,
+            rt->trace_dst_id);
 
-	if (rt->user_param.machine == CLIENT) {
-		char server_ip[INET_ADDRSTRLEN];
-		int server_node;
-
-		if (local_node != TRACE_SUPPORTED_SRC) {
-			fprintf(stderr, "Trace client must run on node %d, local %s is node %d\n",
-				TRACE_SUPPORTED_SRC, local_ip, local_node);
-			return FAILURE;
-		}
-
-		if (trace_resolve_node_id(rt->user_param.servername, &server_node,
-					  server_ip, sizeof(server_ip)))
-			return FAILURE;
-
-		if (server_node != TRACE_SUPPORTED_DST) {
-			fprintf(stderr, "Trace client only supports channel %d->%d, server %s is node %d\n",
-				TRACE_SUPPORTED_SRC, TRACE_SUPPORTED_DST,
-				server_ip, server_node);
-			return FAILURE;
-		}
-
-		return trace_load_for_channel(rt, local_node, server_node);
-	}
-
-	fprintf(stderr, "Trace write_bw could not determine local machine role\n");
-	return FAILURE;
-}
-
-static int trace_exchange_metadata(struct trace_bw_runtime *rt)
-{
-	struct trace_bw_metadata local = { 0 }, remote = { 0 };
-
-	if (rt->user_param.machine == CLIENT) {
-		local.trace_count = hton_64(rt->trace_count);
-		local.max_size = hton_64(rt->trace_max_size);
-	}
-
-	if (ctx_xchg_data(&rt->user_comm, &local, &remote, sizeof(local))) {
-		fprintf(stderr, "Failed to exchange trace metadata\n");
-		return FAILURE;
-	}
-
-	if (rt->user_param.machine == SERVER) {
-		rt->trace_count = ntoh_64(remote.trace_count);
-		rt->trace_max_size = ntoh_64(remote.max_size);
-
-		if (rt->trace_count == 0 || rt->trace_count > TRACE_MAX_FLOWS ||
-		    rt->trace_max_size == 0 || rt->trace_max_size > TRACE_MAX_WR_SIZE) {
-			fprintf(stderr, "Invalid trace metadata: count=%lu max_size=%lu\n",
-				(unsigned long)rt->trace_count,
-				(unsigned long)rt->trace_max_size);
-			return FAILURE;
-		}
-
-		rt->user_param.iters = rt->trace_count;
-		rt->user_param.size = rt->trace_max_size;
-		if (rt->user_comm.rdma_params) {
-			rt->user_comm.rdma_params->iters = rt->trace_count;
-			rt->user_comm.rdma_params->size = rt->trace_max_size;
-		}
-		fprintf(stderr, "[trace] received metadata count=%lu max_size=%lu\n",
-			(unsigned long)rt->trace_count,
-			(unsigned long)rt->trace_max_size);
-	}
-
-	return SUCCESS;
+    /*
+     * Both CLIENT and SERVER scan the same channel before resource
+     * allocation and parameter negotiation. This gives both sides
+     * identical iters and size without a separate metadata exchange.
+     *
+     * SERVER does not use time_ns_list/size_list later, but filling them
+     * here keeps the change minimal by reusing the existing parser.
+     */
+    return trace_load_for_channel(
+        rt,
+        rt->trace_src_id,
+        rt->trace_dst_id);
 }
 
 int trace_bw_prepare(int argc, char **argv, struct trace_bw_runtime *rt){
@@ -458,22 +239,6 @@ int trace_bw_prepare(int argc, char **argv, struct trace_bw_runtime *rt){
 	memset(&rt->user_param,0,sizeof(struct perftest_parameters));
 	memset(&rt->user_comm,0,sizeof(struct perftest_comm));
 	memset(&rt->ctx,0,sizeof(struct pingpong_context));
-
-
-	int my_rank = getenv_int_default("TRACE_MY_RANK", -1);
-	int src_rank = getenv_int_default("TRACE_SRC_RANK", -1);
-	int dst_rank = getenv_int_default("TRACE_DST_RANK", -1);
-	int peer_rank = getenv_int_default("TRACE_PEER_RANK", -1);
-	uint64_t global_start_ns = getenv_u64_default("TRACE_GLOBAL_START_NS", 0);
-
-	fprintf(stderr,
-			"[trace params] role=%s my_rank=%d src=%d dst=%d peer=%d global_start_ns=%lu\n",
-			getenv("TRACE_ROLE"),
-			my_rank,
-			src_rank,
-			dst_rank,
-			peer_rank,
-			(unsigned long)global_start_ns);
 
 	rt->user_param.verb    = WRITE;
 	rt->user_param.tst     = BW;
@@ -549,11 +314,6 @@ int trace_bw_prepare(int argc, char **argv, struct trace_bw_runtime *rt){
 	exchange_versions(&rt->user_comm, &rt->user_param);
 	check_version_compatibility(&rt->user_param);
 	check_sys_data(&rt->user_comm, &rt->user_param);
-
-	if (trace_exchange_metadata(rt)) {
-		dealloc_comm_struct(&rt->user_comm,&rt->user_param);
-		return FAILURE;
-	}
 
 	/* See if MTU is valid and supported. */
 	if (check_mtu(rt->ctx.context,&rt->user_param, &rt->user_comm)) {
