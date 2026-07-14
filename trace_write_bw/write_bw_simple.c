@@ -12,9 +12,9 @@
 
 
 static const char *rank_cx_ip[NRANKS_EXPECTED] = {
-    "192.168.2.10",
-    "192.168.2.12",
-    "192.168.2.11"
+    "192.168.3.10",
+    "192.168.3.12",
+    "192.168.3.11"
 };
 
 static void port_for_rank(int rank, char *buf, size_t len)
@@ -124,6 +124,8 @@ int main(int argc, char **argv)
 {
     int rank, nranks;
     int status = 0;
+    int global_failed = 0;
+    int local_failed = 0;
     pid_t servers[NRANKS_EXPECTED];
     pid_t clients[NRANKS_EXPECTED];
 
@@ -147,7 +149,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    const char *bin = "/home/rdma_traffic_gen/perftest/ib_write_bw";
+    if (argc < 2) {
+        if (rank == 0)
+            fprintf(stderr,
+                    "Usage: %s <ib_write_bw> [ib_write_bw options]\n",
+                    argv[0]);
+
+        MPI_Finalize();
+        return 1;
+    }
+
+    const char *bin = argv[1];
 
     /*
      * Step 1: each rank starts one server for each incoming connection.
@@ -215,27 +227,62 @@ int main(int argc, char **argv)
      */
     for (int dst = 0; dst < nranks; dst++) {
         if (clients[dst] > 0) {
-            waitpid(clients[dst], &status, 0);
-            fprintf(stderr, "[rank %d] client to rank %d finished\n",
-                    rank, dst);
-            fflush(stderr);
+            status = 0;
+            if (waitpid(clients[dst], &status, 0) < 0 ||
+                !WIFEXITED(status) ||
+                WEXITSTATUS(status) != 0) {
+
+                fprintf(stderr,
+                        "[rank %d] client to rank %d failed status=%d\n",
+                        rank, dst, status);
+
+                local_failed = 1;
+            } else {
+                fprintf(stderr,
+                        "[rank %d] client to rank %d finished\n",
+                        rank, dst);
+            }
         }
     }
 
     for (int src = 0; src < nranks; src++) {
         if (servers[src] > 0) {
-            waitpid(servers[src], &status, 0);
-            fprintf(stderr, "[rank %d] server for src rank %d finished\n",
-                    rank, src);
-            fflush(stderr);
+            status = 0;
+            if (waitpid(servers[src], &status, 0) < 0 ||
+                !WIFEXITED(status) ||
+                WEXITSTATUS(status) != 0) {
+
+                fprintf(stderr,
+                        "[rank %d] server to rank %d failed status=%d\n",
+                        rank, src, status);
+
+                local_failed = 1;
+            } else {
+                fprintf(stderr,
+                        "[rank %d] server to rank %d finished\n",
+                        rank, src);
+            }
         }
     }
 
+    MPI_Allreduce(&local_failed,
+                &global_failed,
+                1,
+                MPI_INT,
+                MPI_MAX,
+                MPI_COMM_WORLD);
+
     MPI_Barrier(MPI_COMM_WORLD);
 
-    if (rank == 0)
-        fprintf(stderr, "All full-mesh ib_write_bw processes finished.\n");
+    if (rank == 0) {
+        if (global_failed)
+            fprintf(stderr,
+                    "Full-mesh ib_write_bw test failed.\n");
+        else
+            fprintf(stderr,
+                    "All full-mesh ib_write_bw processes finished successfully.\n");
+    }
 
     MPI_Finalize();
-    return 0;
+    return global_failed ? 1 : 0;
 }
