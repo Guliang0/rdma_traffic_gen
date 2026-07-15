@@ -8,6 +8,10 @@
 #include <time.h>
 
 #define NRANKS_EXPECTED 3
+#define TRACE_LANES_PER_CHANNEL 20
+#define PEERS_PER_RANK (NRANKS_EXPECTED - 1)
+#define CHILDREN_PER_RANK \
+    (PEERS_PER_RANK * TRACE_LANES_PER_CHANNEL * 2)
 #define PORT_BASE 18515
 
 
@@ -17,14 +21,25 @@ static const char *rank_cx_ip[NRANKS_EXPECTED] = {
     "192.168.3.11"
 };
 
-static void port_for_rank(int rank, char *buf, size_t len)
+static int port_for_conn_lane(int src, int dst, int lane_id,
+                              char *buf, size_t len)
 {
-    snprintf(buf, len, "%d", PORT_BASE + rank);
-}
+    long port = PORT_BASE +
+        (src * NRANKS_EXPECTED + dst) * TRACE_LANES_PER_CHANNEL +
+        lane_id;
 
-static void port_for_conn(int src, int dst, char *buf, size_t len)
-{
-    snprintf(buf, len, "%d", PORT_BASE + src * NRANKS_EXPECTED + dst);
+    if (src < 0 || src >= NRANKS_EXPECTED ||
+        dst < 0 || dst >= NRANKS_EXPECTED ||
+        lane_id < 0 || lane_id >= TRACE_LANES_PER_CHANNEL ||
+        port > 65535) {
+        fprintf(stderr,
+                "Invalid connection port src=%d dst=%d lane=%d port=%ld\n",
+                src, dst, lane_id, port);
+        return -1;
+    }
+
+    snprintf(buf, len, "%ld", port);
+    return 0;
 }
 
 static uint64_t wall_time_ns(void)
@@ -54,6 +69,8 @@ static pid_t spawn_write_bw(int rank,
                             const char *server_ip,
                             int src_rank,
                             int dst_rank,
+                            int lane_id,
+                            int lane_count,
                             uint64_t global_start_ns,
                             int argc,
                             char **argv)
@@ -93,12 +110,19 @@ static pid_t spawn_write_bw(int rank,
         setenv_int("TRACE_SRC_RANK", src_rank);
         setenv_int("TRACE_DST_RANK", dst_rank);
         setenv_int("TRACE_PEER_RANK", server_ip ? dst_rank : src_rank);
+        setenv_int("TRACE_LANE_ID", lane_id);
+        setenv_int("TRACE_LANE_COUNT", lane_count);
         setenv_u64("TRACE_GLOBAL_START_NS", global_start_ns);
 
         if (server_ip)
             setenv("TRACE_SERVER_IP", server_ip, 1);
 
-        fprintf(stderr, "[rank %d] exec:", rank);
+        fprintf(stderr,
+                "[rank %d] %s channel=%d->%d lane=%d/%d port=%s%s%s exec:",
+                rank, server_ip ? "client" : "server", src_rank, dst_rank,
+                lane_id, lane_count, port,
+                server_ip ? " server_ip=" : "",
+                server_ip ? server_ip : "");
         for (int i = 0; cmd[i]; i++)
             fprintf(stderr, " %s", cmd[i]);
         fprintf(stderr, "\n");
@@ -126,12 +150,14 @@ int main(int argc, char **argv)
     int status = 0;
     int global_failed = 0;
     int local_failed = 0;
-    pid_t servers[NRANKS_EXPECTED];
-    pid_t clients[NRANKS_EXPECTED];
+    pid_t servers[NRANKS_EXPECTED][TRACE_LANES_PER_CHANNEL];
+    pid_t clients[NRANKS_EXPECTED][TRACE_LANES_PER_CHANNEL];
 
     for (int i = 0; i < NRANKS_EXPECTED; i++) {
-        servers[i] = -1;
-        clients[i] = -1;
+        for (int lane_id = 0; lane_id < TRACE_LANES_PER_CHANNEL; lane_id++) {
+            servers[i][lane_id] = -1;
+            clients[i][lane_id] = -1;
+        }
     }
     uint64_t global_start_ns = 0;
 
@@ -162,30 +188,38 @@ int main(int argc, char **argv)
     const char *bin = argv[1];
 
     /*
-     * Step 1: each rank starts one server for each incoming connection.
-     * Server on rank dst listens at port_for_conn(src, dst).
+     * Step 1: each rank starts one server process per lane for each incoming
+     * connection. Server on rank dst listens at
+     * port_for_conn_lane(src, dst, lane_id).
      */
     for (int src = 0; src < nranks; src++) {
-        char port[16];
-
-        fprintf(stderr, "[rank %d] server loop src=%d rank=%d\n",
-                rank, src, rank);
-        fflush(stderr);
-
-        if (src == rank) {
-            fprintf(stderr, "[rank %d] skip self src=%d\n", rank, src);
-            fflush(stderr);
+        if (src == rank)
             continue;
+
+        for (int lane_id = 0; lane_id < TRACE_LANES_PER_CHANNEL; lane_id++) {
+            char port[16];
+
+            if (port_for_conn_lane(src, rank, lane_id,
+                                   port, sizeof(port)) != 0)
+                MPI_Abort(MPI_COMM_WORLD, 1);
+
+            fprintf(stderr,
+                    "[rank %d] server channel=%d->%d lane=%d/%d listens on %s:%s\n",
+                    rank, src, rank, lane_id, TRACE_LANES_PER_CHANNEL,
+                    rank_cx_ip[rank], port);
+            fflush(stderr);
+
+            servers[src][lane_id] = spawn_write_bw(
+                rank, bin, port, NULL, src, rank,
+                lane_id, TRACE_LANES_PER_CHANNEL,
+                global_start_ns, argc, argv);
+            if (servers[src][lane_id] < 0) {
+                fprintf(stderr,
+                        "[rank %d] failed to start server process channel=%d->%d lane=%d/%d\n",
+                        rank, src, rank, lane_id, TRACE_LANES_PER_CHANNEL);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
         }
-
-        port_for_conn(src, rank, port, sizeof(port));
-
-        fprintf(stderr,
-                "[rank %d] server for src rank %d listens on %s:%s\n",
-                rank, src, rank_cx_ip[rank], port);
-        fflush(stderr);
-
-        servers[src] = spawn_write_bw(rank, bin, port, NULL, src, rank, global_start_ns, argc, argv);    
     }
     sleep(2);
     MPI_Barrier(MPI_COMM_WORLD);
@@ -195,72 +229,94 @@ int main(int argc, char **argv)
 
     MPI_Bcast(&global_start_ns, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
     /*
-     * Step 2: each rank starts one client for each outgoing connection.
-     * Client on rank src connects to rank dst at port_for_conn(src, dst).
+     * Step 2: each rank starts one client process per lane for each outgoing
+     * connection. Client on rank src connects to rank dst at
+     * port_for_conn_lane(src, dst, lane_id).
      */
     for (int dst = 0; dst < nranks; dst++) {
-        char port[16];
-
         if (dst == rank)
             continue;
 
-        port_for_conn(rank, dst, port, sizeof(port));
+        for (int lane_id = 0; lane_id < TRACE_LANES_PER_CHANNEL; lane_id++) {
+            char port[16];
 
-        fprintf(stderr,
-                "[rank %d] client connects to rank %d %s:%s\n",
-                rank, dst, rank_cx_ip[dst], port);
-        fflush(stderr);
+            if (port_for_conn_lane(rank, dst, lane_id,
+                                   port, sizeof(port)) != 0)
+                MPI_Abort(MPI_COMM_WORLD, 1);
 
-        clients[dst] = spawn_write_bw(rank, bin, port,
-                                      rank_cx_ip[dst],
-                                      rank, dst, global_start_ns,
-                                      argc, argv);
-        if (clients[dst] < 0) {
-            fprintf(stderr, "[rank %d] failed to start client for dst %d\n",
-                    rank, dst);
-            MPI_Abort(MPI_COMM_WORLD, 1);
+            fprintf(stderr,
+                    "[rank %d] client channel=%d->%d lane=%d/%d connects to %s:%s\n",
+                    rank, rank, dst, lane_id, TRACE_LANES_PER_CHANNEL,
+                    rank_cx_ip[dst], port);
+            fflush(stderr);
+
+            clients[dst][lane_id] = spawn_write_bw(
+                rank, bin, port, rank_cx_ip[dst], rank, dst,
+                lane_id, TRACE_LANES_PER_CHANNEL,
+                global_start_ns, argc, argv);
+            if (clients[dst][lane_id] < 0) {
+                fprintf(stderr,
+                        "[rank %d] failed to start client process channel=%d->%d lane=%d/%d\n",
+                        rank, rank, dst, lane_id, TRACE_LANES_PER_CHANNEL);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
         }
     }
+
+    fprintf(stderr,
+            "[rank %d] started %d server processes and %d client processes (%d ib_write_bw child processes total)\n",
+            rank, PEERS_PER_RANK * TRACE_LANES_PER_CHANNEL,
+            PEERS_PER_RANK * TRACE_LANES_PER_CHANNEL,
+            CHILDREN_PER_RANK);
+    fflush(stderr);
 
     /*
      * Step 3: wait clients first, then servers.
      */
     for (int dst = 0; dst < nranks; dst++) {
-        if (clients[dst] > 0) {
-            status = 0;
-            if (waitpid(clients[dst], &status, 0) < 0 ||
-                !WIFEXITED(status) ||
-                WEXITSTATUS(status) != 0) {
+        for (int lane_id = 0; lane_id < TRACE_LANES_PER_CHANNEL; lane_id++) {
+            if (clients[dst][lane_id] > 0) {
+                status = 0;
+                if (waitpid(clients[dst][lane_id], &status, 0) < 0 ||
+                    !WIFEXITED(status) ||
+                    WEXITSTATUS(status) != 0) {
 
-                fprintf(stderr,
-                        "[rank %d] client to rank %d failed status=%d\n",
-                        rank, dst, status);
+                    fprintf(stderr,
+                            "[rank %d] client channel=%d->%d lane=%d/%d failed status=%d\n",
+                            rank, rank, dst, lane_id,
+                            TRACE_LANES_PER_CHANNEL, status);
 
-                local_failed = 1;
-            } else {
-                fprintf(stderr,
-                        "[rank %d] client to rank %d finished\n",
-                        rank, dst);
+                    local_failed = 1;
+                } else {
+                    fprintf(stderr,
+                            "[rank %d] client channel=%d->%d lane=%d/%d finished\n",
+                            rank, rank, dst, lane_id,
+                            TRACE_LANES_PER_CHANNEL);
+                }
             }
         }
     }
 
     for (int src = 0; src < nranks; src++) {
-        if (servers[src] > 0) {
-            status = 0;
-            if (waitpid(servers[src], &status, 0) < 0 ||
-                !WIFEXITED(status) ||
-                WEXITSTATUS(status) != 0) {
+        for (int lane_id = 0; lane_id < TRACE_LANES_PER_CHANNEL; lane_id++) {
+            if (servers[src][lane_id] > 0) {
+                status = 0;
+                if (waitpid(servers[src][lane_id], &status, 0) < 0 ||
+                    !WIFEXITED(status) ||
+                    WEXITSTATUS(status) != 0) {
 
-                fprintf(stderr,
-                        "[rank %d] server to rank %d failed status=%d\n",
-                        rank, src, status);
+                    fprintf(stderr,
+                            "[rank %d] server channel=%d->%d lane=%d/%d failed status=%d\n",
+                            rank, src, rank, lane_id,
+                            TRACE_LANES_PER_CHANNEL, status);
 
-                local_failed = 1;
-            } else {
-                fprintf(stderr,
-                        "[rank %d] server to rank %d finished\n",
-                        rank, src);
+                    local_failed = 1;
+                } else {
+                    fprintf(stderr,
+                            "[rank %d] server channel=%d->%d lane=%d/%d finished\n",
+                            rank, src, rank, lane_id,
+                            TRACE_LANES_PER_CHANNEL);
+                }
             }
         }
     }
@@ -277,10 +333,10 @@ int main(int argc, char **argv)
     if (rank == 0) {
         if (global_failed)
             fprintf(stderr,
-                    "Full-mesh ib_write_bw test failed.\n");
+                    "Sharded full-mesh ib_write_bw process test failed.\n");
         else
             fprintf(stderr,
-                    "All full-mesh ib_write_bw processes finished successfully.\n");
+                    "All sharded full-mesh ib_write_bw processes finished successfully.\n");
     }
 
     MPI_Finalize();

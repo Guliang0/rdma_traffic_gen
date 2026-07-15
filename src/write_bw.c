@@ -11,9 +11,10 @@
 #include "perftest_resources.h"
 #include "perftest_communication.h"
 
-#define TRACE_FILE_PATH "trace_write_bw/data/Websearch60.txt"
+#define TRACE_FILE_PATH "data/Websearch60.txt"
 #define TRACE_MAX_FLOWS 10000
 #define TRACE_MAX_WR_SIZE ((uint64_t)UINT_MAX / 2)
+#define TRACE_MAX_LANES 1024
 
 struct trace_bw_runtime {
     struct pingpong_context ctx;
@@ -35,6 +36,8 @@ struct trace_bw_runtime {
 	uint64_t trace_duration_ns;
 	int trace_src_id;
 	int trace_dst_id;
+	int trace_lane_id;
+	int trace_lane_count;
 };
 
 
@@ -44,6 +47,28 @@ static int getenv_int_default(const char *name, int def)
     if (!s || !*s)
         return def;
     return atoi(s);
+}
+
+static int getenv_lane_value(const char *name, int def, int *value)
+{
+	const char *s = getenv(name);
+	char *end = NULL;
+	long parsed;
+
+	if (!s || !*s) {
+		*value = def;
+		return SUCCESS;
+	}
+
+	errno = 0;
+	parsed = strtol(s, &end, 10);
+	if (errno || end == s || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
+		fprintf(stderr, "Invalid %s=%s: expected an integer\n", name, s);
+		return FAILURE;
+	}
+
+	*value = (int)parsed;
+	return SUCCESS;
 }
 
 static int trace_timestamp_to_ns(const char *value, uint64_t *ns)
@@ -60,12 +85,15 @@ static int trace_timestamp_to_ns(const char *value, uint64_t *ns)
 	return SUCCESS;
 }
 
-static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int dst_id)
+static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int dst_id,
+				  int lane_id, int lane_count)
 {
 	FILE *fp;
 	char line[512];
-	uint64_t count = 0, max_size = 0;
-	uint64_t first_ts_ns = 0, last_ts_ns = 0;
+	uint64_t channel_match_count = 0, selected_count = 0, lane_max_size = 0;
+	uint64_t channel_first_ts_ns = 0, first_selected_ts_ns = 0;
+	uint64_t last_selected_ts_ns = 0;
+	int have_channel_first = 0;
 	unsigned long line_no = 0;
 
 	fp = fopen(TRACE_FILE_PATH, "r");
@@ -95,6 +123,18 @@ static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int d
 		if (src != src_id || dst != dst_id)
 			continue;
 
+		if (!have_channel_first) {
+			channel_first_ts_ns = timestamp_ns;
+			have_channel_first = 1;
+		}
+
+		{
+			uint64_t ordinal = channel_match_count;
+			channel_match_count++;
+			if ((ordinal % (uint64_t)lane_count) != (uint64_t)lane_id)
+				continue;
+		}
+
 		if (size == 0) {
 			fprintf(stderr, "%s:%lu: trace record size must be > 0\n",
 				TRACE_FILE_PATH, line_no);
@@ -110,22 +150,23 @@ static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int d
 			return FAILURE;
 		}
 
-		if (count == TRACE_MAX_FLOWS) {
-			fprintf(stderr, "%s:%lu: matched flow count exceeds capacity %d\n",
-				TRACE_FILE_PATH, line_no, TRACE_MAX_FLOWS);
+		if (selected_count == TRACE_MAX_FLOWS) {
+			fprintf(stderr, "%s:%lu: selected flow count exceeds capacity %d for lane=%d/%d\n",
+				TRACE_FILE_PATH, line_no, TRACE_MAX_FLOWS,
+				lane_id, lane_count);
 			fclose(fp);
 			return FAILURE;
 		}
 
-		if (count == 0)
-			first_ts_ns = timestamp_ns;
+		if (selected_count == 0)
+			first_selected_ts_ns = timestamp_ns;
 
-		rt->time_ns_list[count] = timestamp_ns - first_ts_ns;
-		rt->size_list[count] = (uint32_t)size;
-		count++;
-		last_ts_ns = timestamp_ns;
-		if (size > max_size)
-			max_size = size;
+		rt->time_ns_list[selected_count] = timestamp_ns - channel_first_ts_ns;
+		rt->size_list[selected_count] = (uint32_t)size;
+		selected_count++;
+		last_selected_ts_ns = timestamp_ns;
+		if (size > lane_max_size)
+			lane_max_size = size;
 	}
 
 	if (ferror(fp)) {
@@ -135,29 +176,35 @@ static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int d
 	}
 	fclose(fp);
 
-	if (count == 0) {
-		fprintf(stderr, "No trace records matched src=%d dst=%d in %s\n",
-			src_id, dst_id, TRACE_FILE_PATH);
+	if (selected_count == 0) {
+		fprintf(stderr, "No trace records matched src=%d dst=%d lane=%d/%d in %s\n",
+			src_id, dst_id, lane_id, lane_count, TRACE_FILE_PATH);
 		return FAILURE;
 	}
 
-	rt->trace_count = count;
-	rt->trace_max_size = max_size;
-	rt->trace_first_ts_ns = first_ts_ns;
-	rt->trace_duration_ns = last_ts_ns - first_ts_ns;
+	rt->trace_count = selected_count;
+	rt->trace_max_size = lane_max_size;
+	rt->trace_first_ts_ns = channel_first_ts_ns;
+	rt->trace_duration_ns = last_selected_ts_ns - channel_first_ts_ns;
 	rt->trace_src_id = src_id;
 	rt->trace_dst_id = dst_id;
-	rt->user_param.iters = count;
-	rt->user_param.size = max_size;
+	rt->trace_lane_id = lane_id;
+	rt->trace_lane_count = lane_count;
+	rt->user_param.iters = selected_count;
+	rt->user_param.size = lane_max_size;
 	if (rt->user_comm.rdma_params) {
-		rt->user_comm.rdma_params->iters = count;
-		rt->user_comm.rdma_params->size = max_size;
+		rt->user_comm.rdma_params->iters = selected_count;
+		rt->user_comm.rdma_params->size = lane_max_size;
 	}
 
 	fprintf(stderr,
-		"[trace] file=%s src=%d dst=%d count=%lu max_size=%lu first_ts_ns=%lu duration_ns=%lu\n",
-		TRACE_FILE_PATH, src_id, dst_id, (unsigned long)count,
-		(unsigned long)max_size, (unsigned long)first_ts_ns,
+		"[trace] file=%s src=%d dst=%d lane_id=%d lane_count=%d channel_match_count=%lu selected_count=%lu lane_max_size=%lu channel_first_ts_ns=%lu first_selected_ts_ns=%lu first_selected_offset_ns=%lu last_selected_ts_ns=%lu duration_ns=%lu\n",
+		TRACE_FILE_PATH, src_id, dst_id, lane_id, lane_count,
+		(unsigned long)channel_match_count, (unsigned long)selected_count,
+		(unsigned long)lane_max_size, (unsigned long)channel_first_ts_ns,
+		(unsigned long)first_selected_ts_ns,
+		(unsigned long)(first_selected_ts_ns - channel_first_ts_ns),
+		(unsigned long)last_selected_ts_ns,
 		(unsigned long)rt->trace_duration_ns);
 
 	return SUCCESS;
@@ -195,20 +242,38 @@ static int trace_configure_runtime(struct trace_bw_runtime *rt)
     int src_rank = getenv_int_default("TRACE_SRC_RANK", -1);
     int dst_rank = getenv_int_default("TRACE_DST_RANK", -1);
     int peer_rank = getenv_int_default("TRACE_PEER_RANK", -1);
+    int lane_id;
+    int lane_count;
 
     if (trace_check_scope(&rt->user_param))
         return FAILURE;
 
+    if (getenv_lane_value("TRACE_LANE_ID", 0, &lane_id) ||
+        getenv_lane_value("TRACE_LANE_COUNT", 1, &lane_count))
+        return FAILURE;
+
+    if (lane_count < 1 || lane_count > TRACE_MAX_LANES ||
+        lane_id < 0 || lane_id >= lane_count) {
+        fprintf(stderr,
+                "Invalid trace lane configuration: lane_id=%d lane_count=%d (required: 0 <= lane_id < lane_count <= %d)\n",
+                lane_id, lane_count, TRACE_MAX_LANES);
+        return FAILURE;
+    }
+
     rt->trace_src_id = src_rank;
     rt->trace_dst_id = dst_rank;
+    rt->trace_lane_id = lane_id;
+    rt->trace_lane_count = lane_count;
 
-    fprintf(stderr,
-            "[trace] role=%s my_rank=%d peer_rank=%d channel=%d->%d\n",
-            rt->user_param.machine == CLIENT ? "client" : "server",
-            my_rank,
-            peer_rank,
-            rt->trace_src_id,
-            rt->trace_dst_id);
+    // fprintf(stderr,
+    //         "[trace] role=%s my_rank=%d peer_rank=%d channel=%d->%d lane=%d/%d\n",
+    //         rt->user_param.machine == CLIENT ? "client" : "server",
+    //         my_rank,
+    //         peer_rank,
+    //         rt->trace_src_id,
+    //         rt->trace_dst_id,
+    //         rt->trace_lane_id,
+    //         rt->trace_lane_count);
 
     /*
      * Both CLIENT and SERVER scan the same channel before resource
@@ -221,7 +286,9 @@ static int trace_configure_runtime(struct trace_bw_runtime *rt)
     return trace_load_for_channel(
         rt,
         rt->trace_src_id,
-        rt->trace_dst_id);
+        rt->trace_dst_id,
+        rt->trace_lane_id,
+        rt->trace_lane_count);
 }
 
 int trace_bw_prepare(int argc, char **argv, struct trace_bw_runtime *rt){
@@ -469,16 +536,16 @@ int trace_bw_prepare(int argc, char **argv, struct trace_bw_runtime *rt){
 		printf((rt->user_param.cpu_util_data.enable ? RESULT_EXT_CPU_UTIL : RESULT_EXT));
 	}
 
-		uintptr_t buf_base = (uintptr_t)rt->ctx.buf;
-		uintptr_t rdma_base = (uintptr_t)rt->my_dest[0].vaddr;
+		// uintptr_t buf_base = (uintptr_t)rt->ctx.buf;
+		// uintptr_t rdma_base = (uintptr_t)rt->my_dest[0].vaddr;
 
-		fprintf(stderr,
-				"[debug recv] ctx.buf=%p my_dest[0].vaddr=0x%lx diff=%ld size=%lu cycle_buffer=%lu\n",
-				rt->ctx.buf,
-				(unsigned long)rdma_base,
-				(long)(rdma_base - buf_base),
-				(unsigned long)rt->user_param.size,
-				(unsigned long)rt->ctx.cycle_buffer);
+		// fprintf(stderr,
+		// 		"[debug recv] ctx.buf=%p my_dest[0].vaddr=0x%lx diff=%ld size=%lu cycle_buffer=%lu\n",
+		// 		rt->ctx.buf,
+		// 		(unsigned long)rdma_base,
+		// 		(long)(rdma_base - buf_base),
+		// 		(unsigned long)rt->user_param.size,
+		// 		(unsigned long)rt->ctx.cycle_buffer);
 
 	//END AT LINE 272
 	return 0;
@@ -560,23 +627,24 @@ int trace_bw_cleanup(struct trace_bw_runtime *rt){
 			goto destroy_context;
 		}
 		
-		// YJT: TODO: ADD CHECK FOR DATA , ALL PRINT OUT
-		uint64_t print_len = rt->user_param.size < 256 ? rt->user_param.size : 256;
+		// // YJT: TODO: ADD CHECK FOR DATA , ALL PRINT OUT
+		// uint64_t print_len = rt->user_param.size < 256 ? rt->user_param.size : 256;
 
-		uintptr_t buf_base = (uintptr_t)rt->ctx.buf;
-		uintptr_t rdma_base = (uintptr_t)rt->my_dest[0].vaddr;
+		// uintptr_t buf_base = (uintptr_t)rt->ctx.buf;
+		// uintptr_t rdma_base = (uintptr_t)rt->my_dest[0].vaddr;
 
-		char *base = (char *)rt->ctx.buf + (rdma_base - buf_base);
+		// char *base = (char *)rt->ctx.buf + (rdma_base - buf_base);
 		
-		for (uint64_t off = 0; off + 8 <= print_len; off += 8) {
-			uint64_t val = *(uint64_t *)(base + off);
+		// for (uint64_t off = 0; off + 8 <= print_len; off += 8) {
+		// 	uint64_t val = *(uint64_t *)(base + off);
 
-			printf("[recv] base=%p addr=%p offset=%lu value=%016lx\n",
-				base,
-				base + off,
-				(unsigned long)off,
-				val);
-		}
+		// 	printf("[recv] base=%p addr=%p offset=%lu value=%016lx\n",
+		// 		base,
+		// 		base + off,
+		// 		(unsigned long)off,
+		// 		val);
+		// }
+
 		// uintptr_t buf = (uintptr_t)rt->ctx.buf;
 		// uintptr_t vaddr = (uintptr_t)rt->my_dest[0].vaddr;
 		// uintptr_t off = vaddr - buf;
