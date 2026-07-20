@@ -7383,6 +7383,60 @@ static inline void my_sleep_until_ns(uint64_t target_ns)
     }
 }
 
+struct trace_run_result {
+    uint64_t elapsed_ns;
+    uint64_t iters;
+    int32_t status;
+    int32_t reserved;
+};
+
+static int trace_result_fd_from_env(void)
+{
+    const char *value = getenv("TRACE_RESULT_FD");
+    char *end = NULL;
+    long fd;
+
+    if (!value || !*value)
+        return -1;
+
+    errno = 0;
+    fd = strtol(value, &end, 10);
+
+    if (errno || end == value || *end != '\0' ||
+        fd < 0 || fd > INT_MAX) {
+        fprintf(stderr,
+                "Invalid TRACE_RESULT_FD=%s\n",
+                value);
+        return -1;
+    }
+
+    return (int)fd;
+}
+
+static int write_full(int fd, const void *buffer, size_t length)
+{
+    const char *cursor = buffer;
+    size_t written = 0;
+
+    while (written < length) {
+        ssize_t rc = write(fd,
+                           cursor + written,
+                           length - written);
+
+        if (rc > 0) {
+            written += (size_t)rc;
+            continue;
+        }
+
+        if (rc < 0 && errno == EINTR)
+            continue;
+
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
 int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_param, uint64_t *time_ns_list, uint32_t *size_list)
 {
 	uint64_t           	totscnt = 0;
@@ -7409,7 +7463,11 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 	uintptr_t		primary_send_addr = ctx->sge_list[0].addr;
 	int			address_offset = 0;
 	int			flows_burst_iter = 0;
-	uint64_t 			base_time_ns = 0;
+	uint64_t base_time_ns = 0;
+	uint64_t end_time_ns = 0;
+	uint64_t elapsed_ns = 0;
+	int trace_result_fd = trace_result_fd_from_env();
+	int run_completed = 0;
 
 
 
@@ -7466,15 +7524,18 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 
 	gap_deadline = get_cycles();
 
+	base_time_ns = my_now_ns();
+	// fprintf(stderr,
+	// 	"base_time_ns=%lu ns\n",
+	// 	(unsigned long)base_time_ns
+	// );
     /*YJT: MAINLY MODIFY*/
 	/* main loop for posting */
 	while (totscnt < tot_iters  || totccnt < tot_iters) {
 
 		/* main loop to run over all the qps and post each time n messages */
 		for (index =0 ; index < num_of_qps ; index++) {
-			if(ctx->scnt[index] == 0){
-					base_time_ns = my_now_ns();
-			} 
+
 			while ((ctx->scnt[index] < user_param->iters) &&
 					(ctx->scnt[index] + user_param->post_list) <= (user_param->tx_depth + ctx->ccnt[index])) {
 
@@ -7492,10 +7553,10 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 					goto cleaning;
 				}
 
-				uint32_t wr_size = size_list[totscnt]; //my_get_next_wr_size(...);  
+				uint32_t wr_size = size_list[totscnt]; //my_get_next_wr_size(...);
 				uint64_t local_offset = 0;
 				uint64_t remote_offset = 0;
-                
+
 				if (wr_size == 0) {
 					fprintf(stderr, "trace wr_size is zero at index %lu\n",
 							(unsigned long)totscnt);
@@ -7509,7 +7570,7 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 					return_value = FAILURE;
 					goto cleaning;
 				}
-				
+
 				ctx->wr[index].sg_list->addr = ctx->my_addr[index] + local_offset;
 				ctx->wr[index].sg_list->length = wr_size;
 
@@ -7519,28 +7580,14 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
                    fprintf(stderr, "unexpected sg_list mapping\n");
                 }
 
-				uint64_t magic = 0xdeadbeef00000000ULL | (ctx->scnt[index] & 0xffffffff);
+				// uint64_t magic = 0xdeadbeef00000000ULL | (ctx->scnt[index] & 0xffffffff);
 
-				memset((void *)(uintptr_t)ctx->wr[index].sg_list->addr, 0, wr_size);
-				*(uint64_t *)(uintptr_t)ctx->wr[index].sg_list->addr = magic;
+				// memset((void *)(uintptr_t)ctx->wr[index].sg_list->addr, 0, wr_size);
+				// *(uint64_t *)(uintptr_t)ctx->wr[index].sg_list->addr = magic;
 				uint64_t target_ns = base_time_ns + time_ns_list[totscnt];
-				fprintf(stderr,
-						"[send] qp=%d wr=%lu local_addr=%p local_off=%lu remote_addr=0x%lx remote_off=%lu size=%u data=%016lx time=%lu curtime=%lu ns\n",
-						index,
-						(unsigned long)ctx->scnt[index],
-						(void *)(uintptr_t)ctx->wr[index].sg_list->addr,
-						(unsigned long)local_offset,
-						(unsigned long)ctx->wr[index].wr.rdma.remote_addr,
-						(unsigned long)remote_offset,
-						wr_size,
-						*(uint64_t *)(uintptr_t)ctx->wr[index].sg_list->addr,
-						(unsigned long)target_ns,
-						(unsigned long)my_now_ns()
-					);
 
-				
 				my_sleep_until_ns(target_ns);
-				
+
 				if (user_param->noPeak == OFF)
 					user_param->tposted[totscnt] = get_cycles();
 
@@ -7594,8 +7641,10 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 						if (user_param->noPeak == OFF) {
 							if (totccnt > tot_iters)
 								user_param->tcompleted[user_param->iters*num_of_qps - 1] = get_cycles();
-							else
+							else {
 								user_param->tcompleted[totccnt-1] = get_cycles();
+
+							}
 						}
 					}
 
@@ -7607,11 +7656,52 @@ int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user
 
 		}
 	}
+
+	end_time_ns = my_now_ns();
+	elapsed_ns = end_time_ns - base_time_ns;
+	run_completed = 1;
+
 	if (user_param->noPeak == ON && user_param->test_type == ITERATIONS)
 		user_param->tcompleted[0] = get_cycles();
 
+	// fprintf(stderr,
+	// 	" my_now_ns()=%lu ns\n",
+	// 	(unsigned long) my_now_ns()
+	// );
 cleaning:
-	free(dyn_ctx);
-	free(wc);
-	return return_value;
+    /*
+     * Only CLIENT processes receive TRACE_RESULT_FD.
+     * Report one compact result after the hot loop has completed.
+     */
+    if (trace_result_fd >= 0) {
+        struct trace_run_result result;
+
+        memset(&result, 0, sizeof(result));
+
+        result.elapsed_ns =
+            run_completed ? elapsed_ns : 0;
+
+        result.iters =
+            run_completed ? tot_iters : 0;
+
+        result.status =
+            run_completed && return_value == SUCCESS
+                ? SUCCESS
+                : FAILURE;
+
+        if (write_full(trace_result_fd,
+                       &result,
+                       sizeof(result)) != SUCCESS) {
+            fprintf(stderr,
+                    "Failed to write trace run result: %s\n",
+                    strerror(errno));
+            return_value = FAILURE;
+        }
+
+        close(trace_result_fd);
+    }
+
+    free(dyn_ctx);
+    free(wc);
+    return return_value;
 }

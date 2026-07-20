@@ -24,6 +24,8 @@ And use mpirun to launch threads across hosts.
 cd /path/to/rdma_traffic_gen/perftest/trace_write_bw
 
 mpirun -np 3 --hostfile hosts ./mpi_launch_write_bw /home/rdma_traffic_gen/perftest/ib_write_bw -d mlx5_0 -x 3
+
+mpirun -np 3 --hostfile hosts --mca oob_tcp_if_include ens23f0 --mca btl_tcp_if_include ens23f0 ./mpi_launch_write_bw /home/rdma_traffic_gen/perftest/ib_write_bw -d mlx5_1 -F 3 -x 3 --output=bandwidth
 ```
 ## FOR DEVELOPMENT
 Modify perftest/write_bw.c and trace_write_bw/write_bw_simple.c 
