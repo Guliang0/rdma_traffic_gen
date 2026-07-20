@@ -7390,7 +7390,7 @@ struct trace_run_result {
     int32_t reserved;
 };
 
-static int trace_result_fd_from_env(void)
+int trace_result_fd_from_env(void)
 {
     const char *value = getenv("TRACE_RESULT_FD");
     char *end = NULL;
@@ -7413,7 +7413,7 @@ static int trace_result_fd_from_env(void)
     return (int)fd;
 }
 
-static int write_full(int fd, const void *buffer, size_t length)
+int write_full(int fd, const void *buffer, size_t length)
 {
     const char *cursor = buffer;
     size_t written = 0;
@@ -7436,6 +7436,37 @@ static int write_full(int fd, const void *buffer, size_t length)
 
     return SUCCESS;
 }
+
+int trace_report_empty_lane_result(void)
+{
+    int fd = trace_result_fd_from_env();
+
+    if (fd >= 0) {
+        struct trace_run_result result;
+
+        memset(&result, 0, sizeof(result));
+
+        result.elapsed_ns = 0;
+        result.iters = 0;
+        result.status = SUCCESS;
+        result.reserved = 0;
+
+        if (write_full(fd, &result, sizeof(result)) != SUCCESS) {
+            fprintf(stderr,
+                    "Failed to write empty lane trace result: %s\n",
+                    strerror(errno));
+            close(fd);
+            return FAILURE;
+        }
+
+        close(fd);
+    }
+
+    return SUCCESS;
+}
+
+
+
 
 int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_param, uint64_t *time_ns_list, uint32_t *size_list)
 {

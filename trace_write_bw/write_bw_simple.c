@@ -9,19 +9,17 @@
 #include <stdint.h>
 #include <time.h>
 
-#define NRANKS_EXPECTED 3
+
+#define MIN_RANKS_SUPPORTED 2
+#define MAX_RANKS_SUPPORTED 3
 #define TRACE_LANES_PER_CHANNEL 20
-#define PEERS_PER_RANK (NRANKS_EXPECTED - 1)
-#define CHILDREN_PER_RANK \
-    (PEERS_PER_RANK * TRACE_LANES_PER_CHANNEL * 2)
 #define PORT_BASE 18515
 #define TRACE_RESULT_SUCCESS 0
 
-
-static const char *rank_cx_ip[NRANKS_EXPECTED] = {
-    "192.168.3.10",
-    "192.168.3.12",
-    "192.168.3.11"
+static const char *rank_cx_ip[MAX_RANKS_SUPPORTED] = {
+    "192.168.2.10",
+    "192.168.2.12",
+    "192.168.2.11"
 };
 
 struct trace_run_result {
@@ -51,20 +49,37 @@ static int read_full(int fd, void *buffer, size_t length)
     return 0;
 }
 
-static int port_for_conn_lane(int src, int dst, int lane_id,
+static int port_for_conn_lane(int nranks, int src, int dst, int lane_id,
                               char *buf, size_t len)
 {
-    long port = PORT_BASE +
-        (src * NRANKS_EXPECTED + dst) * TRACE_LANES_PER_CHANNEL +
+    long port;
+
+    if (nranks < MIN_RANKS_SUPPORTED || nranks > MAX_RANKS_SUPPORTED ||
+        src < 0 || src >= nranks ||
+        dst < 0 || dst >= nranks ||
+        src == dst ||
+        lane_id < 0 || lane_id >= TRACE_LANES_PER_CHANNEL) {
+        fprintf(stderr,
+                "Invalid connection parameters nranks=%d src=%d dst=%d lane=%d\n",
+                nranks, src, dst, lane_id);
+        return -1;
+    }
+
+    /*
+     * Use the runtime nranks in the mapping.
+     * For -np 2:
+     *   0->1 uses PORT_BASE + (0*2+1)*20 + lane
+     *   1->0 uses PORT_BASE + (1*2+0)*20 + lane
+     * For -np 3 this remains a full-mesh directed-channel mapping.
+     */
+    port = PORT_BASE +
+        (src * nranks + dst) * TRACE_LANES_PER_CHANNEL +
         lane_id;
 
-    if (src < 0 || src >= NRANKS_EXPECTED ||
-        dst < 0 || dst >= NRANKS_EXPECTED ||
-        lane_id < 0 || lane_id >= TRACE_LANES_PER_CHANNEL ||
-        port > 65535) {
+    if (port > 65535) {
         fprintf(stderr,
-                "Invalid connection port src=%d dst=%d lane=%d port=%ld\n",
-                src, dst, lane_id, port);
+                "Invalid connection port nranks=%d src=%d dst=%d lane=%d port=%ld\n",
+                nranks, src, dst, lane_id, port);
         return -1;
     }
 
@@ -147,6 +162,7 @@ static pid_t spawn_write_bw(int rank,
         setenv_int("TRACE_PEER_RANK", server_ip ? dst_rank : src_rank);
         setenv_int("TRACE_LANE_ID", lane_id);
         setenv_int("TRACE_LANE_COUNT", lane_count);
+        setenv_int("INDEX", lane_id);
         setenv_u64("TRACE_GLOBAL_START_NS", global_start_ns);
 
         if (result_write_fd >= 0)
@@ -166,7 +182,13 @@ static pid_t spawn_write_bw(int rank,
         for (int i = 0; cmd[i]; i++)
             fprintf(stderr, " %s", cmd[i]);
         fprintf(stderr, "\n");
-        if(global_start_ns > 0) {
+
+        /*
+         * Keep the original launcher behavior: child waits before exec.
+         * If trace_write_bw already waits internally on TRACE_GLOBAL_START_NS,
+         * remove this block to avoid delaying QP setup until the start time.
+         */
+        if (global_start_ns > 0) {
             struct timespec target;
             target.tv_sec = global_start_ns / 1000000000ULL;
             target.tv_nsec = global_start_ns % 1000000000ULL;
@@ -175,6 +197,7 @@ static pid_t spawn_write_bw(int rank,
             fflush(stderr);
             clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &target, NULL);
         }
+
         execvp(bin, cmd);
         perror("execvp");
         _exit(127);
@@ -192,18 +215,18 @@ int main(int argc, char **argv)
     int local_failed = 0;
     uint64_t local_max_elapsed_ns = 0;
     uint64_t global_max_elapsed_ns = 0;
-    pid_t servers[NRANKS_EXPECTED][TRACE_LANES_PER_CHANNEL];
-    pid_t clients[NRANKS_EXPECTED][TRACE_LANES_PER_CHANNEL];
-    int client_result_fds[NRANKS_EXPECTED][TRACE_LANES_PER_CHANNEL];
+    pid_t servers[MAX_RANKS_SUPPORTED][TRACE_LANES_PER_CHANNEL];
+    pid_t clients[MAX_RANKS_SUPPORTED][TRACE_LANES_PER_CHANNEL];
+    int client_result_fds[MAX_RANKS_SUPPORTED][TRACE_LANES_PER_CHANNEL];
+    uint64_t global_start_ns = 0;
 
-    for (int i = 0; i < NRANKS_EXPECTED; i++) {
+    for (int i = 0; i < MAX_RANKS_SUPPORTED; i++) {
         for (int lane_id = 0; lane_id < TRACE_LANES_PER_CHANNEL; lane_id++) {
             servers[i][lane_id] = -1;
             clients[i][lane_id] = -1;
             client_result_fds[i][lane_id] = -1;
         }
     }
-    uint64_t global_start_ns = 0;
 
     fprintf(stderr, "before MPI_Init\n");
     fflush(stderr);
@@ -212,9 +235,18 @@ int main(int argc, char **argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nranks);
 
-    if (nranks != NRANKS_EXPECTED) {
-        if (rank == 0)
-            fprintf(stderr, "This launcher expects exactly 3 MPI ranks.\n");
+    if (nranks < MIN_RANKS_SUPPORTED || nranks > MAX_RANKS_SUPPORTED) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "This launcher supports %d to %d MPI ranks; got %d.\n",
+                    MIN_RANKS_SUPPORTED, MAX_RANKS_SUPPORTED, nranks);
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    if (rank >= MAX_RANKS_SUPPORTED || rank_cx_ip[rank] == NULL) {
+        fprintf(stderr, "[rank %d] missing rank_cx_ip entry\n", rank);
         MPI_Finalize();
         return 1;
     }
@@ -230,11 +262,13 @@ int main(int argc, char **argv)
     }
 
     const char *bin = argv[1];
+    int peers_per_rank = nranks - 1;
+    int children_per_rank = peers_per_rank * TRACE_LANES_PER_CHANNEL * 2;
 
     /*
      * Step 1: each rank starts one server process per lane for each incoming
      * connection. Server on rank dst listens at
-     * port_for_conn_lane(src, dst, lane_id).
+     * port_for_conn_lane(nranks, src, dst, lane_id).
      */
     for (int src = 0; src < nranks; src++) {
         if (src == rank)
@@ -243,7 +277,7 @@ int main(int argc, char **argv)
         for (int lane_id = 0; lane_id < TRACE_LANES_PER_CHANNEL; lane_id++) {
             char port[16];
 
-            if (port_for_conn_lane(src, rank, lane_id,
+            if (port_for_conn_lane(nranks, src, rank, lane_id,
                                    port, sizeof(port)) != 0)
                 MPI_Abort(MPI_COMM_WORLD, 1);
 
@@ -266,17 +300,20 @@ int main(int argc, char **argv)
             }
         }
     }
+
     sleep(2);
     MPI_Barrier(MPI_COMM_WORLD);
+
     if (rank == 0) {
         global_start_ns = wall_time_ns() + 10ULL * 1000 * 1000 * 1000;
     }
 
     MPI_Bcast(&global_start_ns, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+
     /*
      * Step 2: each rank starts one client process per lane for each outgoing
      * connection. Client on rank src connects to rank dst at
-     * port_for_conn_lane(src, dst, lane_id).
+     * port_for_conn_lane(nranks, src, dst, lane_id).
      */
     for (int dst = 0; dst < nranks; dst++) {
         if (dst == rank)
@@ -286,7 +323,7 @@ int main(int argc, char **argv)
             char port[16];
             int result_pipe[2];
 
-            if (port_for_conn_lane(rank, dst, lane_id,
+            if (port_for_conn_lane(nranks, rank, dst, lane_id,
                                    port, sizeof(port)) != 0)
                 MPI_Abort(MPI_COMM_WORLD, 1);
 
@@ -332,16 +369,20 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr,
-            "[rank %d] started %d server processes and %d client processes (%d ib_write_bw child processes total)\n",
-            rank, PEERS_PER_RANK * TRACE_LANES_PER_CHANNEL,
-            PEERS_PER_RANK * TRACE_LANES_PER_CHANNEL,
-            CHILDREN_PER_RANK);
+            "[rank %d] nranks=%d started %d server processes and %d client processes (%d ib_write_bw child processes total)\n",
+            rank, nranks,
+            peers_per_rank * TRACE_LANES_PER_CHANNEL,
+            peers_per_rank * TRACE_LANES_PER_CHANNEL,
+            children_per_rank);
     fflush(stderr);
 
     /*
      * Step 3: wait clients first, then servers.
      */
     for (int dst = 0; dst < nranks; dst++) {
+        if (dst == rank)
+            continue;
+
         for (int lane_id = 0; lane_id < TRACE_LANES_PER_CHANNEL; lane_id++) {
             if (clients[dst][lane_id] > 0) {
                 struct trace_run_result result;
@@ -352,7 +393,6 @@ int main(int argc, char **argv)
                            WIFEXITED(status) && WEXITSTATUS(status) == 0;
 
                 if (!child_ok) {
-
                     fprintf(stderr,
                             "[rank %d] client channel=%d->%d lane=%d/%d failed status=%d\n",
                             rank, rank, dst, lane_id,
@@ -363,24 +403,29 @@ int main(int argc, char **argv)
                     memset(&result, 0, sizeof(result));
                     if (client_result_fds[dst][lane_id] < 0 ||
                         read_full(client_result_fds[dst][lane_id],
-                                  &result, sizeof(result)) != 0 ||
-                        result.status != TRACE_RESULT_SUCCESS ||
-                        result.elapsed_ns == 0) {
+                                &result, sizeof(result)) != 0 ||
+                        result.status != TRACE_RESULT_SUCCESS) {
+
                         fprintf(stderr,
-                                "[rank %d] invalid client result channel=%d->%d lane=%d/%d status=%d elapsed_ns=%lu\n",
+                                "[rank %d] invalid client result channel=%d->%d lane=%d/%d status=%d elapsed_ns=%lu iters=%lu\n",
                                 rank, rank, dst, lane_id,
-                                TRACE_LANES_PER_CHANNEL, result.status,
-                                (unsigned long)result.elapsed_ns);
+                                TRACE_LANES_PER_CHANNEL,
+                                result.status,
+                                (unsigned long)result.elapsed_ns,
+                                (unsigned long)result.iters);
+
                         local_failed = 1;
                     } else {
-                        if (result.elapsed_ns > local_max_elapsed_ns)
+                        if (result.iters > 0 && result.elapsed_ns > local_max_elapsed_ns)
                             local_max_elapsed_ns = result.elapsed_ns;
 
                         fprintf(stderr,
-                                "[rank %d] client channel=%d->%d lane=%d/%d finished elapsed_ns=%lu\n",
+                                "[rank %d] client channel=%d->%d lane=%d/%d finished elapsed_ns=%lu iters=%lu%s\n",
                                 rank, rank, dst, lane_id,
                                 TRACE_LANES_PER_CHANNEL,
-                                (unsigned long)result.elapsed_ns);
+                                (unsigned long)result.elapsed_ns,
+                                (unsigned long)result.iters,
+                                result.iters == 0 ? " empty-lane" : "");
                     }
                 }
 
@@ -393,6 +438,9 @@ int main(int argc, char **argv)
     }
 
     for (int src = 0; src < nranks; src++) {
+        if (src == rank)
+            continue;
+
         for (int lane_id = 0; lane_id < TRACE_LANES_PER_CHANNEL; lane_id++) {
             if (servers[src][lane_id] > 0) {
                 status = 0;

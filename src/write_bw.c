@@ -11,7 +11,7 @@
 #include "perftest_resources.h"
 #include "perftest_communication.h"
 
-#define TRACE_FILE_PATH "data/Websearch60.txt"
+#define TRACE_FILE_PATH "data/alistorage60_filtered.txt"
 #define TRACE_MAX_FLOWS 10000
 #define TRACE_MAX_WR_SIZE ((uint64_t)UINT_MAX / 2)
 #define TRACE_MAX_LANES 1024
@@ -84,6 +84,8 @@ static int trace_timestamp_to_ns(const char *value, uint64_t *ns)
 	*ns = (uint64_t)(seconds * 1000000000.0L + 0.5L);
 	return SUCCESS;
 }
+
+
 
 static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int dst_id,
 				  int lane_id, int lane_count)
@@ -177,9 +179,30 @@ static int trace_load_for_channel(struct trace_bw_runtime *rt, int src_id, int d
 	fclose(fp);
 
 	if (selected_count == 0) {
-		fprintf(stderr, "No trace records matched src=%d dst=%d lane=%d/%d in %s\n",
-			src_id, dst_id, lane_id, lane_count, TRACE_FILE_PATH);
-		return FAILURE;
+		rt->trace_count = 0;
+		rt->trace_max_size = 1;
+		rt->trace_first_ts_ns = have_channel_first ? channel_first_ts_ns : 0;
+		rt->trace_duration_ns = 0;
+		rt->trace_src_id = src_id;
+		rt->trace_dst_id = dst_id;
+		rt->trace_lane_id = lane_id;
+		rt->trace_lane_count = lane_count;
+
+		rt->user_param.iters = 5;
+
+		rt->user_param.size = 1024;
+
+		if (rt->user_comm.rdma_params) {
+			rt->user_comm.rdma_params->iters = 5;
+			rt->user_comm.rdma_params->size = 1024;
+		}
+
+		fprintf(stderr,
+				"[trace] empty lane file=%s src=%d dst=%d lane=%d/%d channel_match_count=%lu\n",
+				TRACE_FILE_PATH, src_id, dst_id, lane_id, lane_count,
+				(unsigned long)channel_match_count);
+
+		return SUCCESS;
 	}
 
 	rt->trace_count = selected_count;
@@ -561,6 +584,17 @@ int trace_bw_run_once(struct trace_bw_runtime *rt){
 
 	/* REGULAR */
 	{
+
+		if (rt->user_param.machine == CLIENT &&
+			rt->user_param.verb == WRITE &&
+			!rt->user_param.duplex &&
+			rt->trace_count == 0) {
+
+			fprintf(stderr,
+					"[trace] empty lane: no WR will be posted, finish as SUCCESS\n");
+
+        	return trace_report_empty_lane_result();
+    	}
 		if (rt->user_param.machine == CLIENT || rt->user_param.duplex)
 			ctx_set_send_wqes(&rt->ctx,&rt->user_param,rt->rem_dest);
 

@@ -1216,5 +1216,7 @@ int data_validation_stop_and_report(struct pingpong_context *ctx,
 void data_validation_destroy(struct pingpong_context *ctx);
 
 int my_run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_param, uint64_t *time_ns_list, uint32_t *size_list);
-
+int trace_result_fd_from_env(void);
+int trace_report_empty_lane_result(void);
+int write_full(int fd, const void *buffer, size_t length);
 #endif /* PERFTEST_RESOURCES_H */
